@@ -1,0 +1,94 @@
+// Calculate NDVI, EVI, and LSWI for GRL with quality control
+// By Shengfang Ma, 20210930, V1
+// V2, changed the quality control method
+// V3, add the scale and offset for bands according to 
+//     https://developers.google.com/earth-engine/datasets/catalog/LANDSAT_LE07_C02_T1_L2#bands
+
+var GRL = ee.Geometry.Polygon(
+        [[[-98.06677612823205, 35.581015208704706],
+          [-98.06677612823205, 35.53548905993801],
+          [-97.97957214873986, 35.53548905993801],
+          [-97.97957214873986, 35.581015208704706]]]);
+          
+Map.setCenter(-98.0195, 35.5419, 11); // P18
+
+var ImageCollection = ee.ImageCollection(ee.ImageCollection("LANDSAT/LE07/C02/T1_L2"))
+                  .filterBounds(GRL)
+                  .filterDate("2016-01-01","2020-12-31")   //.filterDate("2010-01-01","2010-12-31")
+                  .sort('system:time_start');
+
+print(ImageCollection)
+
+//Bit calculation//
+var getQABits = function(image, start, end, newName) {
+    // Compute the bits we need to extract.
+    var pattern = 0;
+    for (var i = start; i <= end; i++) {
+       pattern += Math.pow(2, i);
+    }
+    // Return a single band image of the extracted QA bits, giving the band a new name.
+    return image.select([0], [newName])
+                  .bitwiseAnd(pattern)
+                  .rightShift(start);
+};
+
+///removing bad observations//
+var filterBadObs = function(image){
+  // [bit 3] Cloud 0:clear 1:cloudy 
+  // [bit 4] Cloud shadow 0: no 1: yes
+  // [bit 5] Snow  0: no 1: yes
+    var cloudQA = getQABits(image.select('pixel_qa'),3,3,'cloud')
+    var cloudShadowQA = getQABits(image.select('pixel_qa'),4,4,'cloud_shadow')
+    var snow = getQABits(image.select('pixel_qa'),5,5,'snow')
+    var maskedImage = ee.Image(0).where(
+      cloudShadowQA.eq(0).and(cloudQA.eq(0)).and(snow.eq(0)),1);
+    return image.updateMask(maskedImage)
+}
+
+
+// Calculate vegetation indices (VIs) including ndvi, evi, and lswi. 
+var vegetationindex=function(img){
+          var qa=img.select('QA_PIXEL')
+          var ndvi=img.normalizedDifference(['SR_B4','SR_B3']).multiply(10000);//ndvi=(nir-red)/(nir+red)
+          var lswi=img.normalizedDifference(['SR_B4','SR_B5']).multiply(10000);//lswi=(nir-swir)/(nir+swir)
+          var evi=img.expression(
+            '2.5 * (nir - red) / (nir + 6 * red - 7.5 * blue + 1)',
+            {
+              red: img.select('SR_B3').multiply(0.0000275).add(-0.2),    
+              nir: img.select('SR_B4').multiply(0.0000275).add(-0.2),    
+              blue: img.select('SR_B1').multiply(0.0000275).add(-0.2)   
+            }
+            ).multiply(10000);
+
+          return img.select([])
+                      .addBands([ndvi,evi,lswi,qa])
+                      .select([0,1,2,3],['ndvi','evi','lswi','pixel_qa'])
+}
+
+var VIcollection=ImageCollection.map(vegetationindex)
+var QualityControledVIcollection=VIcollection.map(filterBadObs)
+print(QualityControledVIcollection)
+
+
+Map.addLayer(QualityControledVIcollection.first().select('ndvi'),{}, 'ndvi');
+Map.addLayer(GRL, {}, 'GRL')
+
+var params= {
+            crs: 'EPSG:4326',
+            scale: 30,
+            region: GRL,
+            maxPixels:1000000000000,
+            driveFolder:'GRL_Landsat7'
+}
+
+var imagelist = QualityControledVIcollection.toList(100);
+var len = imagelist.length().getInfo();
+
+for (var i =0; i < len; i++){
+  
+  var outimage = ee.Image(imagelist.get(i));
+  var str = ee.String(outimage.get('system:index')); 
+  var outname =str.slice(0,21).cat("_VIs");    
+  Export.image(outimage.int16(),ee.String(outname).getInfo(),params);
+  
+}
